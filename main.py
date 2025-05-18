@@ -11,6 +11,7 @@ from functools import wraps
 from smart_contract import SmartContract
 import hashlib
 from sqlalchemy import text
+from models import AdminLimit
 
 app = Flask(__name__)
 app.config.from_object('config.Config')
@@ -76,6 +77,7 @@ def login():
             "user_id": user.id,
             "username": user.username,
             "community": user.community.name,
+            "role": user.role,
             "exp": datetime.utcnow() + timedelta(minutes=JWT_EXPIRATION_MINUTES)
         }
         token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -280,6 +282,78 @@ def test_sql():
     sql = text(f"SELECT * FROM spending WHERE category LIKE '%{q}%'")
     results = db.session.execute(sql)
     return jsonify([dict(r) for r in results])
+
+from superadmin_routes import superadmin_bp
+app.register_blueprint(superadmin_bp)
+
+
+
+@app.route("/admin/set_limit", methods=["PUT"])
+@jwt_required
+def set_monthly_limit():
+    if request.user.role != "admin":
+        return jsonify({"message": "Yetkisiz erişim"}), 403
+
+    data = request.json
+    new_limit = data.get("limit")
+    if new_limit is None:
+        return jsonify({"message": "Limit değeri gerekli"}), 400
+
+    # Topluluğun bu ayki ilk gününü al
+    from datetime import datetime
+    now = datetime.utcnow()
+    first_day_of_month = datetime(now.year, now.month, 1)
+
+    # Var olan kaydı kontrol et
+    from models import AdminLimit
+    existing = AdminLimit.query.filter_by(community_id=request.user.community_id, month=first_day_of_month).first()
+
+    if existing:
+        existing.limit = new_limit
+    else:
+        new_record = AdminLimit(
+            community_id=request.user.community_id,
+            month=first_day_of_month,
+            limit=new_limit
+        )
+        db.session.add(new_record)
+
+    db.session.commit()
+    return jsonify({"message": "Aylık limit ayarlandı"}), 200
+
+@app.route("/admin/monthly_status", methods=["GET"])
+@jwt_required
+def get_monthly_status():
+    if request.user.role != "admin" and request.user.role != "user":
+        return jsonify({"message": "Yetkisiz erişim"}), 403
+
+    from datetime import datetime
+    now = datetime.utcnow()
+    first_day = datetime(now.year, now.month, 1)
+
+    # Limiti al
+    from models import AdminLimit, Spending
+    limit_record = AdminLimit.query.filter_by(
+        community_id=request.user.community_id, month=first_day
+    ).first()
+
+    limit = limit_record.limit if limit_record else 0
+
+    # Harcanan toplamı hesapla
+    from sqlalchemy import func
+    user_ids = [u.id for u in User.query.filter_by(community_id=request.user.community_id).all()]
+    total_spent = db.session.query(func.sum(Spending.amount)).filter(
+        Spending.user_id.in_(user_ids),
+        Spending.timestamp >= first_day
+    ).scalar() or 0
+
+    remaining = limit - total_spent
+
+    return jsonify({
+        "monthly_limit": limit,
+        "total_spent": total_spent,
+        "remaining_limit": remaining
+    })
 
 if __name__ == "__main__":
     app.run(debug=True)

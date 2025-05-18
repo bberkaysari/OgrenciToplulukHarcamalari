@@ -15,6 +15,7 @@ class User(UserMixin, db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
     community_id = db.Column(db.Integer, db.ForeignKey('communities.id'), nullable=False)
+    role = db.Column(db.String(10), nullable=False, default='user')  # user veya admin
 
     community = db.relationship('Community', backref='users')
 
@@ -30,4 +31,17 @@ class Spending(db.Model):
     hash = db.Column(db.String(256))
     previous_hash = db.Column(db.String(256))
 
-    user = db.relationship('User', backref='spendings')  # EKLENDİ
+    user = db.relationship('User', backref='spendings')
+
+class SuperAdmin(db.Model):
+    __tablename__ = 'superadmin'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False)
+
+class AdminLimit(db.Model):
+     __tablename__ = 'admin_limits'
+     id = db.Column(db.Integer, primary_key=True)
+     community_id = db.Column(db.Integer, db.ForeignKey('communities.id'), nullable=False)
+     month = db.Column(db.Date, nullable=False)
+     limit = db.Column(db.Float, nullable=False)
