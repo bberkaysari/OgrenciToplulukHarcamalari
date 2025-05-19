@@ -92,6 +92,41 @@ def delete_admin(user_id):
     db.session.commit()
     return jsonify({"message": "Admin silindi"}), 200
 
+
+@superadmin_bp.route('/add_community', methods=['POST'])
+@superadmin_required
+def add_community():
+    data = request.get_json()
+    name = data.get("name")
+    if not name:
+        return jsonify({"message": "Topluluk adı gerekli"}), 400
+
+    if Community.query.filter_by(name=name).first():
+        return jsonify({"message": "Bu topluluk zaten var"}), 409
+
+    new_community = Community(name=name)
+    db.session.add(new_community)
+    db.session.commit()
+    return jsonify({"message": "Topluluk eklendi"}), 201
+
+@superadmin_bp.route('/superadmin/delete_community/<int:community_id>', methods=['DELETE'])
+@superadmin_required
+def delete_community(community_id):
+    from models import Community, Spending, User
+
+    community = Community.query.get(community_id)
+    if not community:
+        return jsonify({"message": "Topluluk bulunamadı"}), 404
+
+    # Spending'leri user üzerinden topluluğa göre filtrele
+    has_spending = db.session.query(Spending).join(User).filter(User.community_id == community_id).first()
+    if has_spending:
+        return jsonify({"message": "Bu topluluğa ait harcama var, silinemez"}), 400
+
+    db.session.delete(community)
+    db.session.commit()
+    return jsonify({"message": "Topluluk silindi"}), 200
+
 @superadmin_bp.route('/superadmin/admins', methods=['GET'])
 @superadmin_required
 def list_admins():
