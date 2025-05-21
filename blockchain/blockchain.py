@@ -3,6 +3,10 @@ import hashlib
 import time
 import os
 
+DIFFICULTY = 4
+TARGET_TIME = 10  # target block time in seconds
+INTERVAL = 5      # adjust difficulty every 5 blocks
+
 class Block:
     def __init__(self, index, transactions, timestamp, previous_hash, nonce=0, hash=None):
         self.index = index
@@ -13,14 +17,13 @@ class Block:
         self.hash = hash or self.calculate_hash()
 
     def calculate_hash(self):
-        block_data = {
+        block_string = json.dumps({
             "index": self.index,
             "transactions": self.transactions,
             "timestamp": self.timestamp,
             "previous_hash": self.previous_hash,
             "nonce": self.nonce
-        }
-        block_string = json.dumps(block_data, sort_keys=True)
+        }, sort_keys=True, separators=(',', ':'))
         return hashlib.sha256(block_string.encode()).hexdigest()
 
 class Blockchain:
@@ -28,6 +31,7 @@ class Blockchain:
         self.filename = filename
         self.chain = []
         self.pending_transactions = []
+        self.difficulty = DIFFICULTY
         self.load_chain_from_file()
 
     def create_genesis_block(self):
@@ -42,14 +46,36 @@ class Blockchain:
         self.pending_transactions.append(transaction)
 
     def mine_block(self):
-        new_block = Block(
-            index=len(self.chain),
-            transactions=self.pending_transactions,
-            timestamp=time.time(),
-            previous_hash=self.get_latest_block().hash
-        )
-        self.chain.append(new_block)
+        previous_hash = self.get_latest_block().hash
+        index = len(self.chain)
+        timestamp = time.time()
+        transactions = self.pending_transactions
+
+        nonce = 0
+        prefix_str = '0' * self.difficulty
+        while True:
+            candidate_block = Block(index, transactions, timestamp, previous_hash, nonce)
+            candidate_hash = candidate_block.calculate_hash()
+            if candidate_hash.startswith(prefix_str):
+                candidate_block.hash = candidate_hash
+                break
+            nonce += 1
+
+        self.chain.append(candidate_block)
+        self.save_chain_to_file()
         self.pending_transactions = []
+
+        self.adjust_difficulty()  # Call this after mining
+
+        return {
+            "index": candidate_block.index,
+            "hash": candidate_block.hash,
+            "previous_hash": candidate_block.previous_hash,
+            "nonce": candidate_block.nonce
+        }
+
+    def add_block(self, block):
+        self.chain.append(block)
         self.save_chain_to_file()
 
     def save_chain_to_file(self):
@@ -89,3 +115,19 @@ class Blockchain:
             if current.previous_hash != previous.hash:
                 return False
         return True
+
+    def adjust_difficulty(self):
+        if len(self.chain) < INTERVAL + 1:
+            return
+
+        latest_block = self.chain[-1]
+        prev_adjustment_block = self.chain[-INTERVAL - 1]
+        actual_time = latest_block.timestamp - prev_adjustment_block.timestamp
+        expected_time = INTERVAL * TARGET_TIME
+
+        if actual_time < expected_time / 2:
+            self.difficulty += 1
+            print(f"[ZORLUK ARTTI] Yeni zorluk: {self.difficulty}")
+        elif actual_time > expected_time * 2:
+            self.difficulty = max(1, self.difficulty - 1)
+            print(f"[ZORLUK AZALDI] Yeni zorluk: {self.difficulty}")

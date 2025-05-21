@@ -1,6 +1,4 @@
 from flask import Flask, request, jsonify
-from flask_login import login_required
-from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from models import db, User, Spending, Community
 from blockchain.blockchain import Blockchain
@@ -10,8 +8,6 @@ import jwt
 from functools import wraps
 from smart_contract import SmartContract
 import hashlib
-from sqlalchemy import text
-from models import AdminLimit
 
 app = Flask(__name__)
 app.config.from_object('config.Config')
@@ -110,7 +106,6 @@ def add_spending():
     previous_hash = last_spending.hash if last_spending and last_spending.hash else "0"
 
     hash_input = f"{user_id}{amount}{category}{description}{timestamp}{previous_hash}"
-    new_hash = hashlib.sha256(hash_input.encode()).hexdigest()
 
     spending = Spending(
         user_id=user_id,
@@ -118,11 +113,10 @@ def add_spending():
         category=category,
         description=description,
         timestamp=timestamp,
-        hash=new_hash,
+        hash=None,
         previous_hash=previous_hash
     )
     db.session.add(spending)
-    db.session.commit()
 
     blockchain.add_transaction({
         "user_id": user_id,
@@ -133,13 +127,17 @@ def add_spending():
         "description": description,
         "timestamp": str(timestamp)
     })
-    blockchain.mine_block()
+    mined_block = blockchain.mine_block()
+    spending.hash = mined_block["hash"]
+    spending.nonce = mined_block["nonce"]
+    spending.block_index = mined_block["index"]
+    db.session.commit()
     blockchain.save_chain_to_file()
 
     fetch_chain = view_chain()
     return jsonify({
         "message": "Harcama eklendi",
-        "hash": new_hash,
+        "hash": mined_block["hash"],
         "previous_hash": previous_hash
     }), 201
 
@@ -183,29 +181,55 @@ def delete_spending(spending_id):
     if spending.user_id != request.user.id:
         return jsonify({"message": "Bu harcamayı silme yetkiniz yok"}), 403
 
-    # Silinmeden önce hash'i al
-    deleted_hash = spending.hash
+    # Yeni bir 'silindi' bloğu oluştur
+    user_id = request.user.id
+    amount = 0
+    category = spending.category
+    description = f"SİLİNDİ: {spending.description}"
+    timestamp = datetime.utcnow()
 
-    # Harcamayı sil
-    db.session.delete(spending)
+    last_spending = (
+        Spending.query
+        .join(User)
+        .filter(User.community_id == request.user.community_id)
+        .order_by(Spending.id.desc())
+        .first()
+    )
+    previous_hash = last_spending.hash if last_spending and last_spending.hash else "0"
+
+    hash_input = f"{user_id}{amount}{category}{description}{timestamp}{previous_hash}"
+    new_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+
+    deleted_spending = Spending(
+        user_id=user_id,
+        amount=amount,
+        category=category,
+        description=description,
+        timestamp=timestamp,
+        hash=new_hash,
+        previous_hash=previous_hash
+    )
+    db.session.add(deleted_spending)
     db.session.commit()
 
-    # Güncellenmesi gereken harcamaları al (bu hash'i previous_hash olarak kullananlar)
-    to_update = Spending.query.filter_by(previous_hash=deleted_hash).order_by(Spending.id).all()
-
-    for i, s in enumerate(to_update):
-        # Yeni previous_hash: silinen harcamanın previous_hash'ini devral
-        if i == 0:
-            s.previous_hash = spending.previous_hash
-        else:
-            s.previous_hash = to_update[i - 1].hash
-
-        # Yeni hash'i hesapla
-        hash_input = f"{s.user_id}{s.amount}{s.category}{s.description}{s.timestamp}{s.previous_hash}"
-        s.hash = hashlib.sha256(hash_input.encode()).hexdigest()
-
+    blockchain.add_transaction({
+        "user_id": user_id,
+        "username": request.user.username,
+        "community": request.user.community.name,
+        "amount": amount,
+        "category": category,
+        "description": description,
+        "timestamp": str(timestamp)
+    })
+    mined_block = blockchain.mine_block()
+    blockchain.save_chain_to_file()
+    nonce = mined_block["nonce"] if isinstance(mined_block, dict) else getattr(mined_block, "nonce", 0)
+    deleted_spending.nonce = nonce
+    deleted_spending.block_index = mined_block["index"]
     db.session.commit()
-    return jsonify({"message": "Harcama silindi ve zincir güncellendi"}), 200
+
+    return jsonify({"message": "Harcama silindi (blok eklendi)"}), 200
+
 @app.route("/update_spending/<int:spending_id>", methods=["PUT"])
 @jwt_required
 def update_spending(spending_id):
@@ -255,20 +279,97 @@ def update_spending(spending_id):
         current_id = next_spending.id
 
     return jsonify({"message": "Harcama ve zincir güncellendi"}), 200
+
+@app.route("/correct_spending/<int:spending_id>", methods=["POST"])
+@jwt_required
+def correct_spending(spending_id):
+    spending = Spending.query.get(spending_id)
+    if not spending:
+        return jsonify({"message": "Harcama bulunamadı"}), 404
+    if spending.user_id != request.user.id:
+        return jsonify({"message": "Bu harcamayı güncelleyemezsiniz"}), 403
+
+    data = request.json
+    amount = data.get("amount")
+    category = data.get("category", spending.category)
+    description = data.get("description", spending.description)
+    timestamp = datetime.utcnow()
+
+    last_spending = (
+        Spending.query
+        .join(User)
+        .filter(User.community_id == request.user.community_id)
+        .order_by(Spending.id.desc())
+        .first()
+    )
+    previous_hash = last_spending.hash if last_spending and last_spending.hash else "0"
+
+    hash_input = f"{request.user.id}{amount}{category}(DÜZELTME): {description}{timestamp}{previous_hash}"
+    new_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+
+    correction = Spending(
+        user_id=request.user.id,
+        amount=amount,
+        category=category,
+        description=f"(DÜZELTME): {description}",
+        timestamp=timestamp,
+        hash=new_hash,
+        previous_hash=previous_hash
+    )
+    db.session.add(correction)
+    db.session.commit()
+
+    blockchain.add_transaction({
+        "user_id": request.user.id,
+        "username": request.user.username,
+        "community": request.user.community.name,
+        "amount": amount,
+        "category": category,
+        "description": f"(DÜZELTME): {description}",
+        "timestamp": str(timestamp)
+    })
+    mined_block = blockchain.mine_block()
+    correction.block_index = mined_block["index"]
+    blockchain.save_chain_to_file()
+
+    return jsonify({"message": "Düzeltme bloğu eklendi"}), 201
+
 @app.route('/api/spendings', methods=['GET'])
 @jwt_required
 def get_spendings():
     spendings = Spending.query.join(User).filter(User.community_id == request.user.community_id).order_by(Spending.id.asc()).all()
     results = []
+    descriptions = [s.description for s in spendings if not s.description.startswith("(SİLİNDİ):")]
+
     for s in spendings:
+        # Bu harcama zaten bir silme bloğuysa
+        if s.description.startswith("(SİLİNDİ):"):
+            results.append({
+                'id': s.id,
+                'amount': s.amount,
+                'category': s.category,
+                'description': s.description,
+                'timestamp': s.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                'username': s.user.username,
+                'is_deleted': True,
+                'block_index': s.block_index
+            })
+            continue
+
+        # Bu harcama silinmiş mi? Aynı açıklamaya sahip (SİLİNDİ) bloğu varsa silinmiş say
+        silinmis_var = any(f"(SİLİNDİ): {s.description}" in d for d in descriptions if d.startswith("(SİLİNDİ):"))
+
         results.append({
             'id': s.id,
             'amount': s.amount,
             'category': s.category,
             'description': s.description,
             'timestamp': s.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-            'username': s.user.username
+            'username': s.user.username,
+            'is_deleted': silinmis_var,
+            'block_index': s.block_index
         })
+
     return jsonify(results)
 
 @app.route("/user", methods=["GET"])
@@ -276,12 +377,6 @@ def get_spendings():
 def get_user():
     return jsonify({"username": request.user.username})
 
-@app.route("/test_sql", methods=["GET"])
-def test_sql():
-    q = request.args.get("q", "")
-    sql = text(f"SELECT * FROM spending WHERE category LIKE '%{q}%'")
-    results = db.session.execute(sql)
-    return jsonify([dict(r) for r in results])
 
 from superadmin_routes import superadmin_bp
 app.register_blueprint(superadmin_bp)
@@ -340,11 +435,12 @@ def get_monthly_status():
     limit = limit_record.limit if limit_record else 0
 
     # Harcanan toplamı hesapla
-    from sqlalchemy import func
+    from sqlalchemy import func, not_
     user_ids = [u.id for u in User.query.filter_by(community_id=request.user.community_id).all()]
     total_spent = db.session.query(func.sum(Spending.amount)).filter(
         Spending.user_id.in_(user_ids),
-        Spending.timestamp >= first_day
+        Spending.timestamp >= first_day,
+        Spending.deleted == False  # <--- Bunu ekle
     ).scalar() or 0
 
     remaining = limit - total_spent
@@ -354,6 +450,165 @@ def get_monthly_status():
         "total_spent": total_spent,
         "remaining_limit": remaining
     })
+
+...
+
+@app.route("/delete_spending_blockchain/<int:spending_id>", methods=["POST"])
+@jwt_required
+def delete_spending_blockchain(spending_id):
+    spending = Spending.query.get(spending_id)
+    if not spending:
+        return jsonify({"message": "Harcama bulunamadı"}), 404
+
+    if spending.user_id != request.user.id:
+        return jsonify({"message": "Bu harcamayı silme yetkiniz yok"}), 403
+
+    if spending.deleted:
+        return jsonify({"message": "Bu harcama zaten silinmiş"}), 400
+
+    # Harcamayı veritabanında silinmiş olarak işaretle
+    spending.deleted = True
+    db.session.commit()
+
+    # Blok zincire yeni bir sıfır tutarlı silinmiş blok ekle
+    user_id = request.user.id
+    timestamp = datetime.utcnow()
+    last_spending = (
+        Spending.query
+        .join(User)
+        .filter(User.community_id == request.user.community_id)
+        .order_by(Spending.id.desc())
+        .first()
+    )
+    previous_hash = last_spending.hash if last_spending and last_spending.hash else "0"
+
+    new_description = f"(SİLİNDİ): {spending.description}"
+    hash_input = f"{user_id}-0-{spending.category}-{new_description}-{timestamp}-{previous_hash}"
+
+    mined_block = blockchain.mine_block()
+    new_hash = mined_block["hash"]
+    nonce = mined_block["nonce"]
+
+    original_block_index = spending.block_index
+    new_spending = Spending(
+        user_id=user_id,
+        amount=0,
+        category=spending.category,
+        description=new_description,
+        timestamp=timestamp,
+        hash=new_hash,
+        previous_hash=previous_hash,
+        deleted=False,
+        block_index=original_block_index
+    )
+    # Set block_index and nonce before committing
+
+    new_spending.nonce = nonce
+    db.session.add(new_spending)
+    db.session.commit()
+    current_hash = new_spending.hash
+    prev_hash = new_spending.hash
+
+    while True:
+        next_spending = Spending.query.filter_by(previous_hash=prev_hash).order_by(Spending.id.asc()).first()
+        if not next_spending:
+            break
+
+        next_spending.previous_hash = current_hash
+        next_spending.hash = hashlib.sha256(
+            f"{next_spending.user_id}{next_spending.amount}{next_spending.category}{next_spending.description}{next_spending.timestamp}{next_spending.previous_hash}".encode()
+        ).hexdigest()
+
+        db.session.commit()
+
+        prev_hash = next_spending.hash
+        current_hash = next_spending.hash
+
+    blockchain.add_transaction({
+        "user_id": user_id,
+        "username": request.user.username,
+        "community": request.user.community.name,
+        "amount": 0,
+        "category": spending.category,
+        "description": new_description,
+        "timestamp": str(timestamp)
+    })
+    mined_block = blockchain.mine_block()
+    nonce = mined_block["nonce"] if isinstance(mined_block, dict) else getattr(mined_block, "nonce", 0)
+    new_spending.nonce = nonce
+    db.session.commit()
+    blockchain.save_chain_to_file()
+
+    return jsonify({"message": "Silme işlemi blockchain'e kaydedildi"}), 200
+
+@app.route("/update_spending_blockchain/<int:spending_id>", methods=["POST"])
+@jwt_required
+def update_spending_blockchain(spending_id):
+    spending = Spending.query.get(spending_id)
+    if spending.deleted:
+        return jsonify({"message": "Silinmiş bir harcamayı güncelleyemezsiniz"}), 400
+    if not spending:
+        return jsonify({"message": "Harcama bulunamadı"}), 404
+
+    if spending.user_id != request.user.id:
+        return jsonify({"message": "Bu harcamayı güncelleme yetkiniz yok"}), 403
+
+    data = request.json
+    amount = data.get("amount")
+    category = data.get("category")
+    description = data.get("description")
+
+    if amount is None or category is None or description is None:
+        return jsonify({"message": "Tüm alanlar gereklidir"}), 400
+
+    user_id = request.user.id
+    timestamp = datetime.utcnow()
+
+    last_spending = (
+        Spending.query
+        .join(User)
+        .filter(User.community_id == request.user.community_id)
+        .order_by(Spending.id.desc())
+        .first()
+    )
+    previous_hash = last_spending.hash if last_spending and last_spending.hash else "0"
+
+    new_description = f"(DÜZELTME): {description}"
+    hash_input = f"{user_id}-{amount}-{category}-{new_description}-{timestamp}-{previous_hash}"
+    new_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+    original_block_index = spending.block_index
+    spending = Spending.query.get(spending_id)
+    new_spending = Spending(
+        user_id=user_id,
+        amount=amount,
+        category=category,
+        description=new_description,
+        timestamp=timestamp,
+        hash=new_hash,
+        previous_hash=previous_hash,
+        deleted=False,
+        block_index=original_block_index
+    )
+    db.session.add(new_spending)
+
+    blockchain.add_transaction({
+        "user_id": user_id,
+        "username": request.user.username,
+        "community": request.user.community.name,
+        "amount": amount,
+        "category": category,
+        "description": new_description,
+        "timestamp": str(timestamp)
+    })
+    mined_block = blockchain.mine_block()
+    nonce = mined_block["nonce"] if isinstance(mined_block, dict) else getattr(mined_block, "nonce", 0)
+    new_spending.nonce = nonce
+    #new_spending.block_index = mined_block["index"]
+    db.session.commit()
+    blockchain.save_chain_to_file()
+
+    return jsonify({"message": "Güncelleme işlemi blockchain'e kaydedildi"}), 200
+
 
 if __name__ == "__main__":
     app.run(debug=True)

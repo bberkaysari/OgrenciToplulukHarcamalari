@@ -30,8 +30,11 @@ class Spending(db.Model):
 
     hash = db.Column(db.String(256))
     previous_hash = db.Column(db.String(256))
+    block_index = db.Column(db.Integer)
 
     user = db.relationship('User', backref='spendings')
+    deleted = db.Column(db.Boolean, default=False)
+    nonce = db.Column(db.Integer, nullable=False, default=0)
 
 class SuperAdmin(db.Model):
     __tablename__ = 'superadmin'
